@@ -85,8 +85,8 @@ Row rows[] = {
      "Keeps the ground and walls sharp when seen at an angle, instead of blurring into the distance. Costs almost nothing. "
      "Applies after a restart."},
     {"Anti-aliasing", &opts.aa, 0, 2, 1, tx_aa,
-     "Smooths the jagged edges of the 3D before it is scaled up (with AMD FSR 1 on, on AMD and Intel cards). Strong takes every "
-     "edge and stair step, slightly softer."},
+     "Smooths the jagged edges of the 3D before it is scaled up (on AMD and Intel cards, where the game's own upscaler is "
+     "stood in for). Strong takes every edge and stair step, slightly softer."},
     {"AMD FSR 1", &opts.fsr, 0, 2, 1, tx_fsr,
      "AMD's FSR 1 upscaler for the 3D on cards that cannot run the game's own TAAU (AMD, Intel): sharper than the plain "
      "upscale it replaces, at almost no cost. With sharpening, edges and textures are crisper still. No effect on NVIDIA."},

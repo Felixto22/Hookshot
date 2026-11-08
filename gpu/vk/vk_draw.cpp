@@ -4423,7 +4423,8 @@ bool taau_key(uint64_t key) {
 /// fsr1_rcas.comp, ports of AMD's ffx_fsr1.h (MIT). False: not made (a pipeline or the image failed), and the linear
 /// stand-in runs as before. RX_VK_FSR_SHARP=<0..1>: RCAS's strength (default 0.8; FSR's 0.3 stops)
 bool fsr1_stand_in(VkCommandBuffer cmd, const NvnState& s, const Stage& st, uint32_t out_w, uint32_t out_h, VkImageView out_view,
-                   bool sharpen) {
+                   bool sharpen, bool do_fsr, VkImageView* aa_out) {
+    // (do_fsr false: FXAA alone (opts.aa), its result given back in *aa_out for the linear stand-in to read; false returned)
     if (!out_view) return false;
     Texture* in_tex = nullptr;
     uint32_t in_level = 0;
@@ -4484,7 +4485,7 @@ bool fsr1_stand_in(VkCommandBuffer cmd, const NvnState& s, const Stage& st, uint
     static VmaAllocation mid_mem = nullptr;
     static VkImageView mid_view = VK_NULL_HANDLE;
     static uint32_t mid_w = 0, mid_h = 0;
-    if (mid_w != out_w || mid_h != out_h) {
+    if (do_fsr && (mid_w != out_w || mid_h != out_h)) {
         mid = VK_NULL_HANDLE, mid_view = VK_NULL_HANDLE;
         VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_R16G16B16A16_SFLOAT;
@@ -4568,6 +4569,10 @@ bool fsr1_stand_in(VkCommandBuffer cmd, const NvnState& s, const Stage& st, uint
             vkCmdPipelineBarrier2(cmd, &di);
             easu_src = pre_view;
         }
+    }
+    if (!do_fsr) {
+        if (aa_out && easu_src != in_view) *aa_out = easu_src;
+        return false;
     }
     // EASU: the input (or FXAA's result) to `mid`
     {
@@ -4660,7 +4665,9 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     }
     if (!pipe) return false;
     uint32_t size[3] = {std::max(1u, out->width >> level), std::max(1u, out->height >> level), 0};
-    if (opts.fsr > 0 && fsr1_stand_in(cmd, s, st, size[0], size[1], dw.imgs[ntex].imageView, opts.fsr > 1)) {
+    VkImageView aa_view = VK_NULL_HANDLE;   // (felix: FXAA's result when FSR 1 is off, read below in the input's place)
+    if ((opts.fsr > 0 || opts.aa > 0) &&
+        fsr1_stand_in(cmd, s, st, size[0], size[1], dw.imgs[ntex].imageView, opts.fsr > 1, opts.fsr > 0, &aa_view)) {
         probe_image(cmd, out, level, 0, p.key, 't');
         return true;
     }
@@ -4702,7 +4709,7 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     const uint64_t now_frame = texture_frame_no();
     size[2] = !no_clamp && hist_frame && now_frame - hist_frame <= 3 ? 1u : 0u;
     hist_frame = now_frame;
-    const VkDescriptorImageInfo in_info{linear, dw.imgs[0].imageView, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo in_info{linear, aa_view ? aa_view : dw.imgs[0].imageView, VK_IMAGE_LAYOUT_GENERAL};
     const VkDescriptorImageInfo out_info{VK_NULL_HANDLE, dw.imgs[ntex].imageView, VK_IMAGE_LAYOUT_GENERAL};
     const VkDescriptorImageInfo hist_info{VK_NULL_HANDLE, hist_view, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w[3]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
