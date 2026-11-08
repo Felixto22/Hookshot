@@ -155,7 +155,9 @@ def main():
         print("ADR / ADRP+ADD code addresses outside the %d unwind-covered functions: %d, %d of them new entries" % (
             len(spans), len(refs), len(new)))
     L = a64_lift.Lifter(img)
-    if a.standalone:
+    if a.standalone:   # (hookshot) widescreen and ultrawide: C after a few of the game's instructions
+        import oot_wide
+        oot_wide.install(L, img)
         import oot_occlusion   # (no occlusion queries when HOOKSHOT_OCCLUSION_OFF=1: Fritchii's Occlusion Off)
         oot_occlusion.install(L, img)
     L.discover(max_insns=a.max_func)
