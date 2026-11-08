@@ -4,6 +4,9 @@
 // beside image.bin.
 #pragma once
 #include <cstring>
+#ifndef NOMINMAX
+#define NOMINMAX   // (felix: windows.h's min / max macros broke std::min in the files that include this first, vk_shader.cpp)
+#endif
 #include <windows.h>
 
 namespace mkwvk {
