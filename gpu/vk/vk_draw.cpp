@@ -56,6 +56,11 @@ const PointerEntry* pointer_table(const NvnState& s, int stage);
 uint32_t stage_cbuf_word(const NvnState& s, const Stage& st, uint32_t index, uint32_t offset);   // (vk_shader.cpp)
 namespace {
 
+bool no_mesh_firsts() {   // (felix, RX_VK_NO_MESH_FIRSTS=1: indirect mesh draws from task 0 again, as before, for an A/B)
+    static const bool v = getenv("RX_VK_NO_MESH_FIRSTS") != nullptr;
+    return v;
+}
+
 bool no_a2c() {   // (RX_VK_NO_A2C, read once: it was a getenv on every alpha-to-coverage draw, the foliage's)
     static const bool v = getenv("RX_VK_NO_A2C") != nullptr;
     return v;
@@ -3674,6 +3679,7 @@ namespace {
 constexpr uint64_t kMeshRing = 4ull << 20;
 VkBuffer mesh_ring = VK_NULL_HANDLE;
 VmaAllocation mesh_ring_mem = nullptr;
+uint64_t mesh_ring_address = 0;   // (felix: its device address, for the task programs' firsts)
 std::mutex mesh_ring_mu;
 uint64_t mesh_ring_at = 0;
 thread_local VkBuffer mesh_conv_buf = VK_NULL_HANDLE;   // (the converted records for the draw in progress)
@@ -3692,11 +3698,14 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
         std::lock_guard lk(mesh_ring_mu);
         if (!mesh_ring) {
             void* unused = nullptr;
-            if (!create_buffer(kMeshRing, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, mesh_ring,
-                               mesh_ring_mem, &unused))
+            if (!create_buffer(kMeshRing, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, false, mesh_ring, mesh_ring_mem, &unused))
                 return false;
+            VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            da.buffer = mesh_ring;
+            mesh_ring_address = vkGetBufferDeviceAddress(dev.device, &da);
         }
-        const uint64_t bytes = ((uint64_t)n * 12 + 15) & ~15ull;
+        const uint64_t bytes = ((uint64_t)n * 16 + 15) & ~15ull;
         if (mesh_ring_at + bytes > kMeshRing) mesh_ring_at = 0;   // (4 MB: frames of draws before it comes round)
         off = mesh_ring_at;
         mesh_ring_at += bytes;
@@ -3708,13 +3717,29 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, mb.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
     mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier2(cmd, &di);
-    vkCmdFillBuffer(cmd, mesh_ring, off, (uint64_t)n * 12, 1u);
+    vkCmdFillBuffer(cmd, mesh_ring, off, (uint64_t)n * 16, 1u);
     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     vkCmdPipelineBarrier2(cmd, &di);
-    std::vector<VkBufferCopy> regions(n);
-    for (uint32_t i = 0; i < n; i++) regions[i] = {args.offset + (uint64_t)i * stride + 4 * word, off + (uint64_t)i * 12, 4};
-    vkCmdCopyBuffer(cmd, args.buffer, mesh_ring, n, regions.data());
+    // (felix) {count, 1, 1, first}: the record's other word, its first task, in the fourth, where the task programs read it
+    // (emit_spirv_mesh.cpp EmitIsbeRead: + 12, 16 a draw). Records of {count, 1, 1} left every draw's first at 0: the
+    // foliage draws past the first drew the first records again, and the near vegetation (the forest's close grass,
+    // bushes and ferns, drawn from later records) vanished as the camera came up to it
+    const uint32_t first_word = word == 0 ? 1u : 0u;
+    const bool firsts = stride >= 8 && mesh_ring_address != 0;
+    std::vector<VkBufferCopy> regions;
+    regions.reserve((size_t)n * 2);
+    for (uint32_t i = 0; i < n; i++) {
+        regions.push_back({args.offset + (uint64_t)i * stride + 4 * word, off + (uint64_t)i * 16, 4});
+        if (firsts) regions.push_back({args.offset + (uint64_t)i * stride + 4 * first_word, off + (uint64_t)i * 16 + 12, 4});
+    }
+    vkCmdCopyBuffer(cmd, args.buffer, mesh_ring, (uint32_t)regions.size(), regions.data());
+    if (!firsts) {   // (no first in the record: 0, as before)
+        mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        mb.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier2(cmd, &di);
+        for (uint32_t i = 0; i < n; i++) vkCmdFillBuffer(cmd, mesh_ring, off + (uint64_t)i * 16 + 12, 4, 0u);
+    }
     mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     mb.dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, mb.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
     vkCmdPipelineBarrier2(cmd, &di);
@@ -4110,11 +4135,15 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
         if (d.indirect) {
             BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
-            if (mesh_conv_buf) {   // (EvilOOT: the records as {count, 1, 1}, mesh_indirect_convert)
+            if (mesh_conv_buf) {   // (EvilOOT: the records as {count, 1, 1, first}, mesh_indirect_convert)
+                if (mesh_ring_address && p.uses_push && !no_mesh_firsts()) {   // (felix: the task programs' firsts, this draw's records)
+                    const uint64_t firsts = mesh_ring_address + mesh_conv_off + 12;
+                    vkCmdPushConstants(cmd, p.layout, p.push_stages, Shader::Backend::SPIRV::MESH_FIRST_PUSH_OFFSET, 8, &firsts);
+                }
                 if (cnt && vkCmdDrawMeshTasksIndirectCountEXT)
-                    vkCmdDrawMeshTasksIndirectCountEXT(cmd, mesh_conv_buf, mesh_conv_off, cnt.buffer, cnt.offset, d.max, 12);
+                    vkCmdDrawMeshTasksIndirectCountEXT(cmd, mesh_conv_buf, mesh_conv_off, cnt.buffer, cnt.offset, d.max, 16);
                 else
-                    vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_conv_buf, mesh_conv_off, std::max(d.max, 1), 12);
+                    vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_conv_buf, mesh_conv_off, std::max(d.max, 1), 16);
                 mesh_conv_buf = VK_NULL_HANDLE;
                 st_mesh++;
                 st_draws++, pass.draws++;
