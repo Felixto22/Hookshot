@@ -2277,6 +2277,23 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
             d.bias[0] += units, d.bias[2] += slope;
             d.bias_en = true;
         }
+        // (felix) The scenery's sun shadow map (square, depth only, wider than 768: 1600x1600, three cascades, DEPTH16) had
+        // the same fault: the bushes, the ferns and much of the ground shadowed themselves, black at a distance and lighter as
+        // the camera came near (a finer cascade); with the scenery's shadow casters left out they were lit as they should be.
+        // Its depth is moved away from the light the same way, by less (the map is DEPTH16: a unit is 1/65536 of the range,
+        // 256 times the 32-bit float's near 0.5). RX_VK_WORLD_SHADOW_BIAS=<units>,<slope> in DEPTH16 units; 0: as the game asks
+        static float w_units = -1, w_slope = 0;
+        if (w_units < 0) {
+            w_units = 192.0f, w_slope = 3.0f;
+            if (const char* e = getenv("RX_VK_WORLD_SHADOW_BIAS")) sscanf(e, "%f,%f", &w_units, &w_slope);
+        }
+        if ((w_units > 0 || w_slope > 0) && at.n == 0 && at.width == at.height && at.width > 768 && at.depth &&
+            depth_aspect(at.depth_format)) {
+            const float scale = at.depth_format == VK_FORMAT_D16_UNORM ? 1.0f : 256.0f;
+            d.bias[0] += w_units * scale, d.bias[2] += w_slope;
+            d.bias[1] = 0.0f;   // (no clamp: the game's, if any, was set for its own smaller offset)
+            d.bias_en = true;
+        }
     }
     d.cull = sw().no_cull ? VK_CULL_MODE_NONE
            : s.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT
@@ -2314,9 +2331,10 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     }
     if (dump_on()) {   // (RX_VK_DUMP: the state a program draws with, once per change)
         char line[400];
-        int k = snprintf(line, sizeof line, "prog %016llx n%d depth %s dt%u dw%u dop%d st%u cull%u front%u vp %.0f,%.0f %.0fx%.0f z %.2f-%.2f sc %d,%d %ux%u:",
+        int k = snprintf(line, sizeof line, "prog %016llx n%d depth %s dt%u dw%u dop%d bias%u %g/%g/%g st%u cull%u front%u vp %.0f,%.0f %.0fx%.0f z %.2f-%.2f sc %d,%d %ux%u:",
                          (unsigned long long)(cur_program ? cur_program->key : 0), at.n,
-                         at.depth ? (depth ? "yes" : "stencil") : "no", d.dt, d.dw, (int)d.dop, d.st, d.cull, d.front,
+                         at.depth ? (depth ? "yes" : "stencil") : "no", d.dt, d.dw, (int)d.dop, (unsigned)d.bias_en,
+                         d.bias[0], d.bias[1], d.bias[2], d.st, d.cull, d.front,
                          d.vp.x, d.vp.y, d.vp.width, d.vp.height, d.vp.minDepth, d.vp.maxDepth, d.sc.offset.x, d.sc.offset.y,
                          d.sc.extent.width, d.sc.extent.height);
         for (int i = 0; i < at.n && k < (int)sizeof line - 40; i++)
