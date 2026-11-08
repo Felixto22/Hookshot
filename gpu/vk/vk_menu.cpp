@@ -38,6 +38,11 @@ const char* tx_upscale(int v) {
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
     return t[v];
 }
+const char* tx_fsr(int v) {
+    static const char* t[] = {"Off", "On", "On + sharpening"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
 const char* tx_percent(int v) {
     static char b[8];
     snprintf(b, sizeof b, "%d%%", v);
@@ -64,6 +69,9 @@ Row rows[] = {
      "faster."},
     {"Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
      "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
+    {"AMD FSR 1", &opts.fsr, 0, 2, 1, tx_fsr,
+     "AMD's FSR 1 upscaler for the 3D on cards that cannot run the game's own TAAU (AMD, Intel): sharper than the plain "
+     "upscale it replaces, at almost no cost. With sharpening, edges and textures are crisper still. No effect on NVIDIA."},
     {"Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
      "Sharpens the picture as it goes to the window, with or without an upscaling filter. Too much shows halos around edges."},
     {"Game speed", &opts.realtime, 0, 1, 1, tx_speed,
@@ -375,6 +383,7 @@ void menu_init() {
     if (const char* e = getenv("RX_VK_UPSCALE"))
         for (Row& r : rows)
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
+    if (const char* e = getenv("RX_VK_FSR")) opts.fsr = std::min(std::max(atoi(e), 0), 2);   // (felix)
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
 }

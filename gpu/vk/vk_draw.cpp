@@ -29,6 +29,7 @@
 #include "vk_dump.h"
 #include "vk_gprof.h"
 #include "vk_jobs.h"
+#include "vk_menu.h"
 #include "vk_shader.h"
 #include "vk_texture.h"
 
@@ -37,6 +38,8 @@
 #include "shaders/clear_u_frag_spv.h"
 #include "shaders/clear_vert_spv.h"
 #include "shaders/taau_upscale_comp_spv.h"
+#include "shaders/fsr1_easu_comp_spv.h"
+#include "shaders/fsr1_rcas_comp_spv.h"
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 
@@ -4407,6 +4410,131 @@ bool taau_key(uint64_t key) {
     }
     return match;
 }
+/// (felix) AMD FSR 1 in the TAAU stand-in's place (the Insert menu's "AMD FSR 1", opts.fsr): EASU from the network's input
+/// (the scene colour's square root, 1536x864 in Kokiri) to its output's size, into an RGBA16F image of its own; then RCAS
+/// (opts.fsr 2, with sharpening; 1: none) squares it back into the network's output. shaders/fsr1_easu.comp and
+/// fsr1_rcas.comp, ports of AMD's ffx_fsr1.h (MIT). False: not made (a pipeline or the image failed), and the linear
+/// stand-in runs as before. RX_VK_FSR_SHARP=<0..1>: RCAS's strength (default 0.8; FSR's 0.3 stops)
+bool fsr1_stand_in(VkCommandBuffer cmd, const NvnState& s, const Stage& st, uint32_t out_w, uint32_t out_h, VkImageView out_view,
+                   bool sharpen) {
+    if (!out_view) return false;
+    Texture* in_tex = nullptr;
+    uint32_t in_level = 0;
+    const uint32_t in_handle = handle_of(s, st, st.info.texture_descriptors[0], 0);
+    if (!in_handle) return false;
+    const VkImageView in_view = texture_view_of(in_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, VK_FORMAT_UNDEFINED, &in_tex, &in_level);
+    if (!in_view || !in_tex) return false;
+    const uint32_t in_w = std::max(1u, in_tex->width >> in_level), in_h = std::max(1u, in_tex->height >> in_level);
+    static VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE;
+    static VkPipelineLayout easu_layout = VK_NULL_HANDLE, rcas_layout = VK_NULL_HANDLE;
+    static VkSampler nearest = VK_NULL_HANDLE;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        auto make = [](const uint32_t* code, size_t bytes, VkDescriptorType t0, VkDescriptorType t1, uint32_t push, VkPipelineLayout& layout) {
+            VkDescriptorSetLayoutBinding b[2] = {{0, t0, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+                                                 {1, t1, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+            VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+            li.bindingCount = 2, li.pBindings = b;
+            VkDescriptorSetLayout set{};
+            if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set) != VK_SUCCESS) return (VkPipeline)VK_NULL_HANDLE;
+            const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push};
+            VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+            if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout) != VK_SUCCESS) return (VkPipeline)VK_NULL_HANDLE;
+            VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            mi.codeSize = bytes, mi.pCode = code;
+            VkShaderModule m{};
+            if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return (VkPipeline)VK_NULL_HANDLE;
+            VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+            ci.layout = layout;
+            VkPipeline pipe = VK_NULL_HANDLE;
+            if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+            vkDestroyShaderModule(dev.device, m, nullptr);
+            return pipe;
+        };
+        easu = make(FSR1_EASU_COMP_SPV, sizeof FSR1_EASU_COMP_SPV, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16, easu_layout);
+        rcas = make(FSR1_RCAS_COMP_SPV, sizeof FSR1_RCAS_COMP_SPV, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    12, rcas_layout);
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        si.magFilter = si.minFilter = VK_FILTER_NEAREST;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxLod = 0.25f;
+        vkCreateSampler(dev.device, &si, nullptr, &nearest);
+        logf("vk: AMD FSR 1 for the TAAU stand-in: EASU %s, RCAS %s", easu ? "ready" : "not made", rcas ? "ready" : "not made");
+    }
+    if (!easu || !rcas || !nearest) return false;
+    // EASU's output, RCAS's input: made again at a new size (the one before is kept: work in flight may still use it)
+    static VkImage mid = VK_NULL_HANDLE;
+    static VmaAllocation mid_mem = nullptr;
+    static VkImageView mid_view = VK_NULL_HANDLE;
+    static uint32_t mid_w = 0, mid_h = 0;
+    if (mid_w != out_w || mid_h != out_h) {
+        mid = VK_NULL_HANDLE, mid_view = VK_NULL_HANDLE;
+        VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ic.extent = {out_w, out_h, 1}, ic.mipLevels = 1, ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
+        ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+        if (!create_image(ic, mid, mid_mem)) { mid = VK_NULL_HANDLE; return false; }
+        VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vc.image = mid, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = ic.format;
+        vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(dev.device, &vc, nullptr, &mid_view) != VK_SUCCESS) { mid_view = VK_NULL_HANDLE; return false; }
+        VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
+        ib.srcStageMask = VK_PIPELINE_STAGE_2_NONE, ib.srcAccessMask = VK_ACCESS_2_NONE;
+        ib.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        ib.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        ib.image = mid, ib.subresourceRange = vc.subresourceRange;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &ib;
+        vkCmdPipelineBarrier2(cmd, &di);
+        mid_w = out_w, mid_h = out_h;
+        logf("vk: AMD FSR 1: %ux%u -> %ux%u%s", in_w, in_h, out_w, out_h, sharpen ? " (RCAS)" : "");
+    }
+    // EASU: the input to `mid`
+    {
+        const VkDescriptorImageInfo a{nearest, in_view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo b{VK_NULL_HANDLE, mid_view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w[0].pImageInfo = &a;
+        w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, w[1].pImageInfo = &b;
+        const int32_t pc[4] = {(int32_t)in_w, (int32_t)in_h, (int32_t)out_w, (int32_t)out_h};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, easu);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, easu_layout, 0, 2, w);
+        vkCmdPushConstants(cmd, easu_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+        vkCmdDispatch(cmd, (out_w + 7) / 8, (out_h + 7) / 8, 1);
+    }
+    {   // (EASU's writes before RCAS's reads)
+        VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+        mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+        vkCmdPipelineBarrier2(cmd, &di);
+    }
+    // RCAS: `mid` to the network's output (squared back to scene colour)
+    {
+        static const float strength = getenv("RX_VK_FSR_SHARP") ? std::clamp((float)atof(getenv("RX_VK_FSR_SHARP")), 0.0f, 1.0f) : 0.8f;
+        const VkDescriptorImageInfo a{VK_NULL_HANDLE, mid_view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo b{VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL};
+        VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, w[0].pImageInfo = &a;
+        w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, w[1].pImageInfo = &b;
+        struct { int32_t w, h; float sharp; } pc{(int32_t)out_w, (int32_t)out_h, sharpen ? strength : 0.0f};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rcas);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rcas_layout, 0, 2, w);
+        vkCmdPushConstants(cmd, rcas_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(cmd, (out_w + 7) / 8, (out_h + 7) / 8, 1);
+    }
+    descriptors_disturbed();   // (the program's own pushes are gone from the bind point)
+    return true;
+}
 bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS") : "fd029a317a9a4b94";
     if (!taau_key(p.key) || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR || p.stages.empty()) return false;
@@ -4459,6 +4587,10 @@ bool taau_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     }
     if (!pipe) return false;
     uint32_t size[3] = {std::max(1u, out->width >> level), std::max(1u, out->height >> level), 0};
+    if (opts.fsr > 0 && fsr1_stand_in(cmd, s, st, size[0], size[1], dw.imgs[ntex].imageView, opts.fsr > 1)) {
+        probe_image(cmd, out, level, 0, p.key, 't');
+        return true;
+    }
     // (the stand-in's last output, which bounds this one's pixels: shaders/taau_upscale.comp. Made again at a new size,
     // the first frame unbounded; RX_VK_TAAU_NO_CLAMP=1: never bounded)
     static VkImage hist = VK_NULL_HANDLE;

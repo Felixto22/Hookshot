@@ -17,6 +17,7 @@ struct Options {
     int ultrawide = 0;    // the camera at the monitor's shape when it is wider than 16:9; read once, at the start (host/hos_main.c)
     int show_fps = 0;
     int fullscreen = 0;   // borderless, at the monitor's size: F11 is the same setting
+    int fsr = 2;          // (felix) AMD FSR 1 where OoT's TAAU network is stood in for (AMD, Intel): 0 off (the linear upscale), 1 EASU, 2 EASU + RCAS
 };
 extern Options opts;
 

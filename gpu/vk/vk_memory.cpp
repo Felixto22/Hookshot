@@ -766,7 +766,10 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
         }
     }
     pages_from += from;
-    if (++reads % 20000 == 0)
+    // (felix) every 20,000 reads was ~40% of a 12-minute log (14,000 lines) and its own small cost on the replay thread:
+    // RX_VK_LOG_READS=1 brings it back
+    static const bool log_reads = getenv("RX_VK_LOG_READS") != nullptr;
+    if (++reads % 20000 == 0 && log_reads)
         logf("vk: replay reads of guest memory as submitted: %lld (%lld pages from the captures)", (long long)reads.load(),
              (long long)pages_from.load());
     return true;

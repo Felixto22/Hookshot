@@ -1,0 +1,38 @@
+#version 450
+// (felix) AMD FidelityFX Super Resolution 1, RCAS (Robust Contrast Adaptive Sharpening), after fsr1_easu.comp: a
+// port of ffx_fsr1.h's FsrRcasF (MIT, Copyright (c) 2021 Advanced Micro Devices, Inc.) to plain GLSL floats. A cross
+// of five texels; the sharpening lobe is the largest that keeps every channel of the result inside [0, 1] around the
+// neighbours' range, scaled by pc.sharp (1: the most, as FSR's 0 stops; 0: none).
+//
+// `src` holds EASU's output in the network's perceptual encoding (the square root of the scene colour); the result
+// is squared back to scene colour and written to the network's output image (R11G11B10).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba16f) uniform readonly image2D src;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 size; float sharp; } pc;
+
+vec3 at(ivec2 p) { return imageLoad(src, clamp(p, ivec2(0), pc.size - 1)).rgb; }
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    //    b
+    //  d e f
+    //    h
+    const vec3 b = at(g + ivec2(0, -1)), d = at(g + ivec2(-1, 0)), e = at(g), f = at(g + ivec2(1, 0)), h = at(g + ivec2(0, 1));
+    vec3 pix = e;
+    if (pc.sharp > 0.0) {
+        const vec3 mn4 = min(min(b, d), min(f, h)), mx4 = max(max(b, d), max(f, h));
+        // (the input may exceed 1 in a bright scene: the limits are taken over the actual range, as FSR's HDR use)
+        const vec3 top = max(max(mx4, e), vec3(1.0));
+        const vec3 hitMin = min(mn4, e) / (4.0 * max(mx4, vec3(1.0 / 65536.0)));
+        const vec3 hitMax = (top - max(mx4, e)) / (4.0 * min(mn4, e) - 4.0 * top);
+        const vec3 lobeRGB = max(-hitMin, hitMax);
+        const float limit = 0.25 - 1.0 / 16.0;   // (FSR_RCAS_LIMIT)
+        const float lobe = max(-limit, min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * pc.sharp;
+        pix = (lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0);
+    }
+    pix = max(pix, vec3(0.0));
+    if (any(isnan(pix)) || any(isinf(pix))) pix = max(e, vec3(0.0));
+    imageStore(dst, g, vec4(pix * pix, 1.0));
+}
