@@ -41,6 +41,11 @@
 #include "shaders/fsr1_easu_comp_spv.h"
 #include "shaders/fsr1_rcas_comp_spv.h"
 #include "shaders/fxaa_comp_spv.h"
+#include "shaders/smaa_edges_comp_spv.h"
+#include "shaders/smaa_weights_comp_spv.h"
+#include "shaders/smaa_blend_comp_spv.h"
+#include "shaders/smaa/AreaTex.h"
+#include "shaders/smaa/SearchTex.h"
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 
@@ -4417,6 +4422,165 @@ bool taau_key(uint64_t key) {
     }
     return match;
 }
+namespace {
+/// (felix) An image of our own in GENERAL layout, w x h, for the post-processing passes below; null on failure
+struct OwnImage { VkImage image = VK_NULL_HANDLE; VmaAllocation mem = nullptr; VkImageView view = VK_NULL_HANDLE; uint32_t w = 0, h = 0; };
+bool own_image(VkCommandBuffer cmd, OwnImage& o, uint32_t w, uint32_t h, VkFormat format, VkImageUsageFlags usage) {
+    if (o.view && o.w == w && o.h == h) return true;
+    o = OwnImage{};   // (the one before is kept: work in flight may still use it, and sizes seldom change)
+    VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ic.imageType = VK_IMAGE_TYPE_2D, ic.format = format;
+    ic.extent = {w, h, 1}, ic.mipLevels = 1, ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
+    ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = usage;
+    VkImage img = VK_NULL_HANDLE;
+    VmaAllocation mem = nullptr;
+    if (!create_image(ic, img, mem)) return false;
+    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vc.image = img, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = format;
+    vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView view = VK_NULL_HANDLE;
+    if (vkCreateImageView(dev.device, &vc, nullptr, &view) != VK_SUCCESS) return false;
+    VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
+    ib.srcStageMask = VK_PIPELINE_STAGE_2_NONE, ib.srcAccessMask = VK_ACCESS_2_NONE;
+    ib.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    ib.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    ib.image = img, ib.subresourceRange = vc.subresourceRange;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &ib;
+    vkCmdPipelineBarrier2(cmd, &di);
+    o.image = img, o.mem = mem, o.view = view, o.w = w, o.h = h;
+    return true;
+}
+void compute_to_compute(VkCommandBuffer cmd) {   // (a pass's writes before the next one's reads)
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+/// A compute pipeline over push descriptors of these types and a push constant block of `push` bytes
+VkPipeline own_compute(const uint32_t* code, size_t bytes, std::initializer_list<VkDescriptorType> types, uint32_t push,
+                       VkPipelineLayout& layout) {
+    std::vector<VkDescriptorSetLayoutBinding> b;
+    for (VkDescriptorType t : types) b.push_back({(uint32_t)b.size(), t, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+    VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    li.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+    li.bindingCount = (uint32_t)b.size(), li.pBindings = b.data();
+    VkDescriptorSetLayout set{};
+    if (vkCreateDescriptorSetLayout(dev.device, &li, nullptr, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
+    const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push};
+    VkPipelineLayoutCreateInfo pi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pi.setLayoutCount = 1, pi.pSetLayouts = &set, pi.pushConstantRangeCount = 1, pi.pPushConstantRanges = &pr;
+    if (vkCreatePipelineLayout(dev.device, &pi, nullptr, &layout) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    mi.codeSize = bytes, mi.pCode = code;
+    VkShaderModule m{};
+    if (vkCreateShaderModule(dev.device, &mi, nullptr, &m) != VK_SUCCESS) return VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, m, "main", nullptr};
+    ci.layout = layout;
+    VkPipeline pipe = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(dev.device, VK_NULL_HANDLE, 1, &ci, nullptr, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
+    vkDestroyShaderModule(dev.device, m, nullptr);
+    return pipe;
+}
+VkWriteDescriptorSet image_write(uint32_t binding, VkDescriptorType type, const VkDescriptorImageInfo* info) {
+    VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstBinding = binding, w.descriptorCount = 1, w.descriptorType = type, w.pImageInfo = info;
+    return w;
+}
+} // namespace
+
+/// (felix) SMAA 1x at its Ultra preset (shaders/smaa/: Jimenez et al., MIT) over the TAAU stand-in's input, in_w x in_h: luma
+/// edges, blending weights from SMAA's precomputed area and search tables, and the neighbourhood blend into an RGBA16F image of
+/// our own, whose view is returned (null: not made; the input is used as it is)
+VkImageView smaa_pass(VkCommandBuffer cmd, VkImageView in_view, uint32_t in_w, uint32_t in_h) {
+    static VkPipeline edges = VK_NULL_HANDLE, weights = VK_NULL_HANDLE, blend = VK_NULL_HANDLE;
+    static VkPipelineLayout edges_l = VK_NULL_HANDLE, weights_l = VK_NULL_HANDLE, blend_l = VK_NULL_HANDLE;
+    static VkSampler lin = VK_NULL_HANDLE;
+    static OwnImage area, search, edge_img, weight_img, out_img;
+    static bool tried = false, tables = false;
+    constexpr VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if (!tried) {
+        tried = true;
+        edges = own_compute(SMAA_EDGES_COMP_SPV, sizeof SMAA_EDGES_COMP_SPV, {S, I}, 16, edges_l);
+        weights = own_compute(SMAA_WEIGHTS_COMP_SPV, sizeof SMAA_WEIGHTS_COMP_SPV, {S, S, S, I}, 16, weights_l);
+        blend = own_compute(SMAA_BLEND_COMP_SPV, sizeof SMAA_BLEND_COMP_SPV, {S, S, I}, 16, blend_l);
+        VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};   // (SMAA: every sampler linear and clamped)
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        si.maxLod = 0.25f;
+        vkCreateSampler(dev.device, &si, nullptr, &lin);
+        // the area and search tables, uploaded once through a buffer that is never let go (180 KB)
+        const VkImageUsageFlags tu = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VmaAllocation staging_mem = nullptr;
+        void* map = nullptr;
+        if (edges && weights && blend && lin && own_image(cmd, area, AREATEX_WIDTH, AREATEX_HEIGHT, VK_FORMAT_R8G8_UNORM, tu) &&
+            own_image(cmd, search, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, VK_FORMAT_R8_UNORM, tu) &&
+            create_buffer(sizeof areaTexBytes + sizeof searchTexBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, true, staging, staging_mem, &map) &&
+            map) {
+            std::memcpy(map, areaTexBytes, sizeof areaTexBytes);
+            std::memcpy((uint8_t*)map + sizeof areaTexBytes, searchTexBytes, sizeof searchTexBytes);
+            VkBufferImageCopy c{};
+            c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            c.imageExtent = {AREATEX_WIDTH, AREATEX_HEIGHT, 1};
+            vkCmdCopyBufferToImage(cmd, staging, area.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            c.bufferOffset = sizeof areaTexBytes;
+            c.imageExtent = {SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, 1};
+            vkCmdCopyBufferToImage(cmd, staging, search.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            tables = true;
+        }
+        logf("vk: SMAA (Ultra) for the TAAU stand-in: %s", tables ? "ready" : "not made");
+    }
+    if (!tables) return VK_NULL_HANDLE;
+    const VkImageUsageFlags ru = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    const bool resized = edge_img.w != in_w || edge_img.h != in_h;
+    if (!own_image(cmd, edge_img, in_w, in_h, VK_FORMAT_R8G8B8A8_UNORM, ru) || !own_image(cmd, weight_img, in_w, in_h, VK_FORMAT_R8G8B8A8_UNORM, ru) ||
+        !own_image(cmd, out_img, in_w, in_h, VK_FORMAT_R16G16B16A16_SFLOAT, ru))
+        return VK_NULL_HANDLE;
+    if (resized) logf("vk: SMAA at %ux%u", in_w, in_h);
+    compute_to_compute(cmd);   // (the tables' copy, and what wrote the input)
+    const float metrics[4] = {1.0f / in_w, 1.0f / in_h, (float)in_w, (float)in_h};
+    const uint32_t gx = (in_w + 7) / 8, gy = (in_h + 7) / 8;
+    {   // edges
+        const VkDescriptorImageInfo a{lin, in_view, VK_IMAGE_LAYOUT_GENERAL}, b{VK_NULL_HANDLE, edge_img.view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkWriteDescriptorSet w[2] = {image_write(0, S, &a), image_write(1, I, &b)};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, edges);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, edges_l, 0, 2, w);
+        vkCmdPushConstants(cmd, edges_l, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof metrics, metrics);
+        vkCmdDispatch(cmd, gx, gy, 1);
+    }
+    compute_to_compute(cmd);
+    {   // blending weights
+        const VkDescriptorImageInfo a{lin, edge_img.view, VK_IMAGE_LAYOUT_GENERAL}, b{lin, area.view, VK_IMAGE_LAYOUT_GENERAL},
+            c{lin, search.view, VK_IMAGE_LAYOUT_GENERAL}, d{VK_NULL_HANDLE, weight_img.view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkWriteDescriptorSet w[4] = {image_write(0, S, &a), image_write(1, S, &b), image_write(2, S, &c), image_write(3, I, &d)};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, weights);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, weights_l, 0, 4, w);
+        vkCmdPushConstants(cmd, weights_l, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof metrics, metrics);
+        vkCmdDispatch(cmd, gx, gy, 1);
+    }
+    compute_to_compute(cmd);
+    {   // neighbourhood blending
+        const VkDescriptorImageInfo a{lin, in_view, VK_IMAGE_LAYOUT_GENERAL}, b{lin, weight_img.view, VK_IMAGE_LAYOUT_GENERAL},
+            c{VK_NULL_HANDLE, out_img.view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkWriteDescriptorSet w[3] = {image_write(0, S, &a), image_write(1, S, &b), image_write(2, I, &c)};
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, blend);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, blend_l, 0, 3, w);
+        vkCmdPushConstants(cmd, blend_l, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof metrics, metrics);
+        vkCmdDispatch(cmd, gx, gy, 1);
+    }
+    compute_to_compute(cmd);
+    return out_img.view;
+}
+
 /// (felix) AMD FSR 1 in the TAAU stand-in's place (the Insert menu's "AMD FSR 1", opts.fsr): EASU from the network's input
 /// (the scene colour's square root, 1536x864 in Kokiri) to its output's size, into an RGBA16F image of its own; then RCAS
 /// (opts.fsr 2, with sharpening; 1: none) squares it back into the network's output. shaders/fsr1_easu.comp and
@@ -4512,7 +4676,9 @@ bool fsr1_stand_in(VkCommandBuffer cmd, const NvnState& s, const Stage& st, uint
     // (felix) FXAA first, at the input's size (the Insert menu's Anti-aliasing, opts.aa: 1 FXAA, 2 aggressive): the input to `pre`,
     // which EASU then reads. Not made (a pipeline or the image): EASU reads the input as before
     VkImageView easu_src = in_view;
-    if (opts.aa > 0 && fxaa && bilinear) {
+    if (opts.aa == 3) {   // (felix: SMAA instead of FXAA)
+        if (const VkImageView v = smaa_pass(cmd, in_view, in_w, in_h)) easu_src = v;
+    } else if (opts.aa > 0 && fxaa && bilinear) {
         static VkImage pre = VK_NULL_HANDLE;
         static VmaAllocation pre_mem = nullptr;
         static VkImageView pre_view = VK_NULL_HANDLE;

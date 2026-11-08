@@ -45,7 +45,7 @@ const char* tx_aniso(int v) {
     return t[v];
 }
 const char* tx_aa(int v) {
-    static const char* t[] = {"Off", "FXAA", "FXAA (strong)"};
+    static const char* t[] = {"Off", "FXAA", "FXAA (strong)", "SMAA"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
 }
@@ -84,9 +84,10 @@ Row rows[] = {
     {"Anisotropic filtering", &opts.aniso, 0, 16, 1, tx_aniso,
      "Keeps the ground and walls sharp when seen at an angle, instead of blurring into the distance. Costs almost nothing. "
      "Applies after a restart."},
-    {"Anti-aliasing", &opts.aa, 0, 2, 1, tx_aa,
+    {"Anti-aliasing", &opts.aa, 0, 3, 1, tx_aa,
      "Smooths the jagged edges of the 3D before it is scaled up (on AMD and Intel cards, where the game's own upscaler is "
-     "stood in for). Strong takes every edge and stair step, slightly softer."},
+     "stood in for). FXAA strong takes every edge and stair step, slightly softer; SMAA finds edges more precisely and keeps "
+     "textures sharper."},
     {"AMD FSR 1", &opts.fsr, 0, 2, 1, tx_fsr,
      "AMD's FSR 1 upscaler for the 3D on cards that cannot run the game's own TAAU (AMD, Intel): sharper than the plain "
      "upscale it replaces, at almost no cost. With sharpening, edges and textures are crisper still. No effect on NVIDIA."},
@@ -403,7 +404,7 @@ void menu_init() {
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
     if (const char* e = getenv("RX_VK_ANISO")) opts.aniso = std::min(std::max(atoi(e), 0), 16);   // (felix)
     if (opts.aniso != 0 && opts.aniso != 2 && opts.aniso != 4 && opts.aniso != 8 && opts.aniso != 16) opts.aniso = 16;
-    if (const char* e = getenv("RX_VK_AA")) opts.aa = std::min(std::max(atoi(e), 0), 2);   // (felix)
+    if (const char* e = getenv("RX_VK_AA")) opts.aa = std::min(std::max(atoi(e), 0), 3);   // (felix)
     if (const char* e = getenv("RX_VK_FSR")) opts.fsr = std::min(std::max(atoi(e), 0), 2);   // (felix)
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
