@@ -40,6 +40,7 @@
 #include "shaders/taau_upscale_comp_spv.h"
 #include "shaders/fsr1_easu_comp_spv.h"
 #include "shaders/fsr1_rcas_comp_spv.h"
+#include "shaders/fxaa_comp_spv.h"
 #include "shaders/movie_upscale_comp_spv.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 
@@ -4431,9 +4432,9 @@ bool fsr1_stand_in(VkCommandBuffer cmd, const NvnState& s, const Stage& st, uint
     const VkImageView in_view = texture_view_of(in_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, VK_FORMAT_UNDEFINED, &in_tex, &in_level);
     if (!in_view || !in_tex) return false;
     const uint32_t in_w = std::max(1u, in_tex->width >> in_level), in_h = std::max(1u, in_tex->height >> in_level);
-    static VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE;
-    static VkPipelineLayout easu_layout = VK_NULL_HANDLE, rcas_layout = VK_NULL_HANDLE;
-    static VkSampler nearest = VK_NULL_HANDLE;
+    static VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE, fxaa = VK_NULL_HANDLE;
+    static VkPipelineLayout easu_layout = VK_NULL_HANDLE, rcas_layout = VK_NULL_HANDLE, fxaa_layout = VK_NULL_HANDLE;
+    static VkSampler nearest = VK_NULL_HANDLE, bilinear = VK_NULL_HANDLE;
     static bool tried = false;
     if (!tried) {
         tried = true;
@@ -4465,12 +4466,17 @@ bool fsr1_stand_in(VkCommandBuffer cmd, const NvnState& s, const Stage& st, uint
                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 16, easu_layout);
         rcas = make(FSR1_RCAS_COMP_SPV, sizeof FSR1_RCAS_COMP_SPV, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     12, rcas_layout);
+        fxaa = make(FXAA_COMP_SPV, sizeof FXAA_COMP_SPV, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    20, fxaa_layout);
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.magFilter = si.minFilter = VK_FILTER_NEAREST;
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.maxLod = 0.25f;
         vkCreateSampler(dev.device, &si, nullptr, &nearest);
-        logf("vk: AMD FSR 1 for the TAAU stand-in: EASU %s, RCAS %s", easu ? "ready" : "not made", rcas ? "ready" : "not made");
+        si.magFilter = si.minFilter = VK_FILTER_LINEAR;
+        vkCreateSampler(dev.device, &si, nullptr, &bilinear);
+        logf("vk: AMD FSR 1 for the TAAU stand-in: EASU %s, RCAS %s, FXAA %s", easu ? "ready" : "not made", rcas ? "ready" : "not made",
+             fxaa ? "ready" : "not made");
     }
     if (!easu || !rcas || !nearest) return false;
     // EASU's output, RCAS's input: made again at a new size (the one before is kept: work in flight may still use it)
@@ -4502,9 +4508,70 @@ bool fsr1_stand_in(VkCommandBuffer cmd, const NvnState& s, const Stage& st, uint
         mid_w = out_w, mid_h = out_h;
         logf("vk: AMD FSR 1: %ux%u -> %ux%u%s", in_w, in_h, out_w, out_h, sharpen ? " (RCAS)" : "");
     }
-    // EASU: the input to `mid`
+    // (felix) FXAA first, at the input's size (the Insert menu's Anti-aliasing, opts.aa: 1 FXAA, 2 aggressive): the input to `pre`,
+    // which EASU then reads. Not made (a pipeline or the image): EASU reads the input as before
+    VkImageView easu_src = in_view;
+    if (opts.aa > 0 && fxaa && bilinear) {
+        static VkImage pre = VK_NULL_HANDLE;
+        static VmaAllocation pre_mem = nullptr;
+        static VkImageView pre_view = VK_NULL_HANDLE;
+        static uint32_t pre_w = 0, pre_h = 0;
+        if (pre_w != in_w || pre_h != in_h) {
+            pre = VK_NULL_HANDLE, pre_view = VK_NULL_HANDLE, pre_w = pre_h = 0;
+            VkImageCreateInfo ic{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ic.imageType = VK_IMAGE_TYPE_2D, ic.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            ic.extent = {in_w, in_h, 1}, ic.mipLevels = 1, ic.arrayLayers = 1, ic.samples = VK_SAMPLE_COUNT_1_BIT;
+            ic.tiling = VK_IMAGE_TILING_OPTIMAL, ic.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            VkImage img = VK_NULL_HANDLE;
+            VmaAllocation mem = nullptr;
+            if (create_image(ic, img, mem)) {
+                VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+                vc.image = img, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = ic.format;
+                vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                VkImageView view = VK_NULL_HANDLE;
+                if (vkCreateImageView(dev.device, &vc, nullptr, &view) == VK_SUCCESS) {
+                    VkImageMemoryBarrier2 ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
+                    ib.srcStageMask = VK_PIPELINE_STAGE_2_NONE, ib.srcAccessMask = VK_ACCESS_2_NONE;
+                    ib.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    ib.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                    ib.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    ib.image = img, ib.subresourceRange = vc.subresourceRange;
+                    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+                    di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &ib;
+                    vkCmdPipelineBarrier2(cmd, &di);
+                    pre = img, pre_mem = mem, pre_view = view, pre_w = in_w, pre_h = in_h;
+                    logf("vk: FXAA at %ux%u before FSR 1", in_w, in_h);
+                }
+            }
+        }
+        if (pre_view) {
+            const VkDescriptorImageInfo a{bilinear, in_view, VK_IMAGE_LAYOUT_GENERAL};
+            const VkDescriptorImageInfo b{VK_NULL_HANDLE, pre_view, VK_IMAGE_LAYOUT_GENERAL};
+            VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+            w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w[0].pImageInfo = &a;
+            w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, w[1].pImageInfo = &b;
+            // (FXAA's own presets: 1 its default quality, 2 its strongest: every sub-pixel step smoothed, the faintest edges taken)
+            struct { int32_t w, h; float subpix, edge, edge_min; } pc{(int32_t)in_w, (int32_t)in_h,
+                                                                      opts.aa > 1 ? 1.0f : 0.75f, opts.aa > 1 ? 0.063f : 0.125f,
+                                                                      opts.aa > 1 ? 0.0312f : 0.0625f};
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fxaa);
+            vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fxaa_layout, 0, 2, w);
+            vkCmdPushConstants(cmd, fxaa_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+            vkCmdDispatch(cmd, (in_w + 7) / 8, (in_h + 7) / 8, 1);
+            VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (FXAA's writes before EASU's reads)
+            mb.srcStageMask = mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.memoryBarrierCount = 1, di.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(cmd, &di);
+            easu_src = pre_view;
+        }
+    }
+    // EASU: the input (or FXAA's result) to `mid`
     {
-        const VkDescriptorImageInfo a{nearest, in_view, VK_IMAGE_LAYOUT_GENERAL};
+        const VkDescriptorImageInfo a{nearest, easu_src, VK_IMAGE_LAYOUT_GENERAL};
         const VkDescriptorImageInfo b{VK_NULL_HANDLE, mid_view, VK_IMAGE_LAYOUT_GENERAL};
         VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
         w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, w[0].pImageInfo = &a;

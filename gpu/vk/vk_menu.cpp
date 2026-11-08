@@ -44,6 +44,11 @@ const char* tx_aniso(int v) {
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
 }
+const char* tx_aa(int v) {
+    static const char* t[] = {"Off", "FXAA", "FXAA (strong)"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
 const char* tx_fsr(int v) {
     static const char* t[] = {"Off", "On", "On + sharpening"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
@@ -55,7 +60,7 @@ const char* tx_percent(int v) {
     return b;
 }
 const char* tx_resolution(int v) {
-    static const char* t[] = {"Auto", "100%", "75%", "67%", "50%", "133%", "150%", "167%"};   // (felix: 5-7 above the console's scale)
+    static const char* t[] = {"Auto", "100%", "75%", "67%", "50%"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
 }
@@ -71,14 +76,17 @@ Row rows[] = {
      "can show artifacts."},
     {"Frame pacing", &opts.pace, 0, 1, 1, tx_onoff,
      "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
-    {"Resolution", &opts.resolution, 0, 7, 1, tx_resolution,
+    {"Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
      "How sharp the 3D is drawn. Auto lets the game lower it when the GPU is busy. A fixed percentage stays steady: lower is "
-     "faster. Above 100% draws more than the console does (133%: 2048x1152, 167%: 2560x1440): sharper, heavier on the GPU."},
+     "faster."},
     {"Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
      "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
     {"Anisotropic filtering", &opts.aniso, 0, 16, 1, tx_aniso,
      "Keeps the ground and walls sharp when seen at an angle, instead of blurring into the distance. Costs almost nothing. "
      "Applies after a restart."},
+    {"Anti-aliasing", &opts.aa, 0, 2, 1, tx_aa,
+     "Smooths the jagged edges of the 3D before it is scaled up (with AMD FSR 1 on, on AMD and Intel cards). Strong takes every "
+     "edge and stair step, slightly softer."},
     {"AMD FSR 1", &opts.fsr, 0, 2, 1, tx_fsr,
      "AMD's FSR 1 upscaler for the 3D on cards that cannot run the game's own TAAU (AMD, Intel): sharper than the plain "
      "upscale it replaces, at almost no cost. With sharpening, edges and textures are crisper still. No effect on NVIDIA."},
@@ -395,6 +403,7 @@ void menu_init() {
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
     if (const char* e = getenv("RX_VK_ANISO")) opts.aniso = std::min(std::max(atoi(e), 0), 16);   // (felix)
     if (opts.aniso != 0 && opts.aniso != 2 && opts.aniso != 4 && opts.aniso != 8 && opts.aniso != 16) opts.aniso = 16;
+    if (const char* e = getenv("RX_VK_AA")) opts.aa = std::min(std::max(atoi(e), 0), 2);   // (felix)
     if (const char* e = getenv("RX_VK_FSR")) opts.fsr = std::min(std::max(atoi(e), 0), 2);   // (felix)
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
@@ -473,13 +482,6 @@ void menu_tick() {
             Row& r = rows[selected];
             int v = *r.value + (press[4] ? r.step : -r.step);
             if (r.value == &opts.framegen && v == 1) v = press[4] ? 2 : 0;   // (off, 2x ... 8x)
-            if (r.value == &opts.resolution) {   // (felix: in order of scale: Auto, 167%, 150%, 133%, 100%, 75%, 67%, 50%)
-                static const int steps[] = {0, 7, 6, 5, 1, 2, 3, 4};
-                int at = 0;
-                while (at < 7 && steps[at] != *r.value) at++;
-                at = (at + (press[4] ? 7 : 1)) % 8;
-                v = steps[at];
-            }
             if (r.value == &opts.aniso) {   // (felix: the game's own, 2x, 4x, 8x, 16x)
                 static const int steps[] = {0, 2, 4, 8, 16};
                 int at = 0;

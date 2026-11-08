@@ -18,6 +18,7 @@ struct Options {
     int show_fps = 0;
     int fullscreen = 0;   // borderless, at the monitor's size: F11 is the same setting
     int aniso = 16;       // (felix) anisotropic filtering: 0 the game's own, else 2, 4, 8, 16 samples at least (after a restart)
+    int aa = 2;           // (felix) anti-aliasing before FSR 1 (where it runs): 0 off, 1 FXAA, 2 FXAA at its strongest
     int fsr = 2;          // (felix) AMD FSR 1 where OoT's TAAU network is stood in for (AMD, Intel): 0 off (the linear upscale), 1 EASU, 2 EASU + RCAS
 };
 extern Options opts;

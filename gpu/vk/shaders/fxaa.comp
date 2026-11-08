@@ -1,0 +1,114 @@
+#version 450
+// (felix) FXAA (Timothy Lottes' Fast Approximate Anti-Aliasing 3.11, its Quality path at preset 39: 12 search steps) on the
+// 3D before FSR 1 brings it up (vk_draw.cpp fsr1_stand_in). OoT has no anti-aliasing of its own at this point: its TAAU
+// network is spatial, and on cards that cannot run it the stair-stepped edges of the 1536x864 scene were stretched as they
+// were. A re-implementation in plain GLSL of the published algorithm.
+//
+// The input is the network's perceptual encoding (the square root of the scene colour), close to the gamma space FXAA
+// expects; its luma is taken from it. pc.subpix: how much of the sub-pixel aliasing is removed (0.75 FXAA's default, 1.0
+// the most: softer); pc.edge, pc.edge_min: the local contrast an edge needs (0.125 / 0.0625 FXAA's "high quality",
+// 0.063 / 0.0312 its "overkill").
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D src;   // (linear filtering)
+layout(binding = 1, rgba16f) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 size; float subpix; float edge; float edge_min; } pc;
+
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+float lum_at(vec2 uv) { return luma(textureLod(src, uv, 0.0).rgb); }
+float lum_off(vec2 uv, vec2 rcp, ivec2 o) { return luma(textureLod(src, uv + vec2(o) * rcp, 0.0).rgb); }
+
+const int kSteps = 12;
+const float kStep[kSteps] = float[](1.0, 1.0, 1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(g, pc.size))) return;
+    const vec2 rcp = 1.0 / vec2(pc.size);
+    vec2 posM = (vec2(g) + 0.5) * rcp;
+    const vec4 rgbyM = textureLod(src, posM, 0.0);
+    const float lumaM = luma(rgbyM.rgb);
+    float lumaS = lum_off(posM, rcp, ivec2(0, 1));
+    float lumaE = lum_off(posM, rcp, ivec2(1, 0));
+    float lumaN = lum_off(posM, rcp, ivec2(0, -1));
+    float lumaW = lum_off(posM, rcp, ivec2(-1, 0));
+    const float rangeMax = max(max(max(lumaN, lumaW), max(lumaE, lumaS)), lumaM);
+    const float rangeMin = min(min(min(lumaN, lumaW), min(lumaE, lumaS)), lumaM);
+    const float range = rangeMax - rangeMin;
+    vec3 outc = rgbyM.rgb;
+    if (range >= max(pc.edge_min, rangeMax * pc.edge)) {
+        const float lumaNW = lum_off(posM, rcp, ivec2(-1, -1));
+        const float lumaSE = lum_off(posM, rcp, ivec2(1, 1));
+        const float lumaNE = lum_off(posM, rcp, ivec2(1, -1));
+        const float lumaSW = lum_off(posM, rcp, ivec2(-1, 1));
+        const float lumaNS = lumaN + lumaS, lumaWE = lumaW + lumaE;
+        const float subpixRcpRange = 1.0 / range;
+        const float subpixNSWE = lumaNS + lumaWE;
+        const float edgeHorz1 = -2.0 * lumaM + lumaNS, edgeVert1 = -2.0 * lumaM + lumaWE;
+        const float lumaNESE = lumaNE + lumaSE, lumaNWNE = lumaNW + lumaNE;
+        const float edgeHorz2 = -2.0 * lumaE + lumaNESE, edgeVert2 = -2.0 * lumaN + lumaNWNE;
+        const float lumaNWSW = lumaNW + lumaSW, lumaSWSE = lumaSW + lumaSE;
+        const float edgeHorz4 = abs(edgeHorz1) * 2.0 + abs(edgeHorz2), edgeVert4 = abs(edgeVert1) * 2.0 + abs(edgeVert2);
+        const float edgeHorz3 = -2.0 * lumaW + lumaNWSW, edgeVert3 = -2.0 * lumaS + lumaSWSE;
+        const float edgeHorz = abs(edgeHorz3) + edgeHorz4, edgeVert = abs(edgeVert3) + edgeVert4;
+        const float subpixNWSWNESE = lumaNWSW + lumaNESE;
+        const bool horzSpan = edgeHorz >= edgeVert;
+        float lengthSign = horzSpan ? rcp.y : rcp.x;
+        const float subpixA = subpixNSWE * 2.0 + subpixNWSWNESE;
+        if (!horzSpan) lumaN = lumaW, lumaS = lumaE;
+        const float subpixB = subpixA * (1.0 / 12.0) - lumaM;
+        const float gradientN = lumaN - lumaM, gradientS = lumaS - lumaM;
+        float lumaNN = lumaN + lumaM;
+        const float lumaSS = lumaS + lumaM;
+        const bool pairN = abs(gradientN) >= abs(gradientS);
+        const float gradient = max(abs(gradientN), abs(gradientS));
+        if (pairN) lengthSign = -lengthSign;
+        const float subpixC = clamp(abs(subpixB) * subpixRcpRange, 0.0, 1.0);
+        vec2 posB = posM;
+        const vec2 offNP = horzSpan ? vec2(rcp.x, 0.0) : vec2(0.0, rcp.y);
+        if (!horzSpan) posB.x += lengthSign * 0.5;
+        else posB.y += lengthSign * 0.5;
+        vec2 posN = posB - offNP * kStep[0];
+        vec2 posP = posB + offNP * kStep[0];
+        const float subpixD = -2.0 * subpixC + 3.0;
+        float lumaEndN = lum_at(posN);
+        const float subpixE = subpixC * subpixC;
+        float lumaEndP = lum_at(posP);
+        if (!pairN) lumaNN = lumaSS;
+        const float gradientScaled = gradient * 0.25;
+        const float lumaMM = lumaM - lumaNN * 0.5;
+        const float subpixF = subpixD * subpixE;
+        const bool lumaMLTZero = lumaMM < 0.0;
+        lumaEndN -= lumaNN * 0.5;
+        lumaEndP -= lumaNN * 0.5;
+        bool doneN = abs(lumaEndN) >= gradientScaled;
+        bool doneP = abs(lumaEndP) >= gradientScaled;
+        if (!doneN) posN -= offNP * kStep[1];
+        if (!doneP) posP += offNP * kStep[1];
+        for (int i = 2; i < kSteps && !(doneN && doneP); i++) {
+            if (!doneN) lumaEndN = lum_at(posN) - lumaNN * 0.5;
+            if (!doneP) lumaEndP = lum_at(posP) - lumaNN * 0.5;
+            doneN = doneN || abs(lumaEndN) >= gradientScaled;
+            doneP = doneP || abs(lumaEndP) >= gradientScaled;
+            if (!doneN) posN -= offNP * kStep[i];
+            if (!doneP) posP += offNP * kStep[i];
+        }
+        const float dstN = horzSpan ? posM.x - posN.x : posM.y - posN.y;
+        const float dstP = horzSpan ? posP.x - posM.x : posP.y - posM.y;
+        const bool goodSpanN = (lumaEndN < 0.0) != lumaMLTZero;
+        const bool goodSpanP = (lumaEndP < 0.0) != lumaMLTZero;
+        const float spanLength = dstP + dstN;
+        const bool directionN = dstN < dstP;
+        const float dst = min(dstN, dstP);
+        const bool goodSpan = directionN ? goodSpanN : goodSpanP;
+        const float subpixG = subpixF * subpixF;
+        const float pixelOffset = spanLength > 0.0 ? dst * (-1.0 / spanLength) + 0.5 : 0.0;
+        const float subpixH = subpixG * pc.subpix;
+        const float pixelOffsetGood = goodSpan ? pixelOffset : 0.0;
+        const float pixelOffsetSubpix = max(pixelOffsetGood, subpixH);
+        if (!horzSpan) posM.x += pixelOffsetSubpix * lengthSign;
+        else posM.y += pixelOffsetSubpix * lengthSign;
+        outc = textureLod(src, posM, 0.0).rgb;
+    }
+    if (any(isnan(outc)) || any(isinf(outc))) outc = rgbyM.rgb;
+    imageStore(dst, g, vec4(outc, 1.0));
+}
