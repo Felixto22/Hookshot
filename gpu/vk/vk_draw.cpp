@@ -1061,8 +1061,14 @@ VkSampler sampler_for(int id, bool compare) {
                         ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     ci.addressModeU = wrap(p.ws), ci.addressModeV = wrap(p.wt), ci.addressModeW = wrap(p.wr);
     ci.mipLodBias = std::clamp(p.lod_bias, -dev.props.limits.maxSamplerLodBias, dev.props.limits.maxSamplerLodBias);
-    ci.anisotropyEnable = p.aniso > 1.0f && dev.features.samplerAnisotropy;
-    ci.maxAnisotropy = std::clamp(p.aniso, 1.0f, dev.props.limits.maxSamplerAnisotropy);
+    // (felix) the Insert menu's Anisotropic filtering (opts.aniso: 0 the game's own, else at least that many samples): the ground and
+    // walls seen at an angle stay sharp instead of blurring into the distance. Mipmapped linear samplers only (not the UI's point
+    // samplers, not depth comparisons). Samplers are made once, so it applies after a restart
+    float aniso = p.aniso;
+    if (opts.aniso > 1 && !compare && ci.minFilter == VK_FILTER_LINEAR && ci.mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR)
+        aniso = std::max(aniso, (float)opts.aniso);
+    ci.anisotropyEnable = aniso > 1.0f && dev.features.samplerAnisotropy;
+    ci.maxAnisotropy = std::clamp(aniso, 1.0f, dev.props.limits.maxSamplerAnisotropy);
     ci.compareEnable = compare && p.cmp_mode != 0;
     ci.compareOp = compare_op(p.cmp_func);
     {   // (amd-fix) A depth-reference sample through a sampler that does not compare is undefined in Vulkan: NVIDIA's driver

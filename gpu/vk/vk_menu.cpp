@@ -38,6 +38,12 @@ const char* tx_upscale(int v) {
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];   // (a setting past the row: the label, not the next bytes)
     return t[v];
 }
+const char* tx_aniso(int v) {
+    static const char* t[] = {"Game's own", "", "2x (restart)", "", "4x (restart)", "", "", "", "8x (restart)", "", "", "", "", "", "", "",
+                              "16x (restart)"};
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
+    return t[v];
+}
 const char* tx_fsr(int v) {
     static const char* t[] = {"Off", "On", "On + sharpening"};
     if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
@@ -69,6 +75,9 @@ Row rows[] = {
      "faster."},
     {"Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
      "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
+    {"Anisotropic filtering", &opts.aniso, 0, 16, 1, tx_aniso,
+     "Keeps the ground and walls sharp when seen at an angle, instead of blurring into the distance. Costs almost nothing. "
+     "Applies after a restart."},
     {"AMD FSR 1", &opts.fsr, 0, 2, 1, tx_fsr,
      "AMD's FSR 1 upscaler for the 3D on cards that cannot run the game's own TAAU (AMD, Intel): sharper than the plain "
      "upscale it replaces, at almost no cost. With sharpening, edges and textures are crisper still. No effect on NVIDIA."},
@@ -383,6 +392,8 @@ void menu_init() {
     if (const char* e = getenv("RX_VK_UPSCALE"))
         for (Row& r : rows)
             if (r.value == &opts.upscale) *r.value = std::min(std::max(atoi(e), r.lo), r.hi);
+    if (const char* e = getenv("RX_VK_ANISO")) opts.aniso = std::min(std::max(atoi(e), 0), 16);   // (felix)
+    if (opts.aniso != 0 && opts.aniso != 2 && opts.aniso != 4 && opts.aniso != 8 && opts.aniso != 16) opts.aniso = 16;
     if (const char* e = getenv("RX_VK_FSR")) opts.fsr = std::min(std::max(atoi(e), 0), 2);   // (felix)
     if (const char* e = getenv("HOS_REALTIME_STEP")) opts.realtime = atoi(e) != 0;
     if (const char* e = getenv("HOS_DYNRES")) opts.resolution = atoi(e) != 0 ? 0 : 1;
@@ -461,6 +472,13 @@ void menu_tick() {
             Row& r = rows[selected];
             int v = *r.value + (press[4] ? r.step : -r.step);
             if (r.value == &opts.framegen && v == 1) v = press[4] ? 2 : 0;   // (off, 2x ... 8x)
+            if (r.value == &opts.aniso) {   // (felix: the game's own, 2x, 4x, 8x, 16x)
+                static const int steps[] = {0, 2, 4, 8, 16};
+                int at = 0;
+                while (at < 4 && steps[at] != *r.value) at++;
+                at = (at + (press[4] ? 1 : 4)) % 5;
+                v = steps[at];
+            }
             *r.value = v > r.hi ? r.lo : v < r.lo ? r.hi : v;
             changed = true;
             save();
