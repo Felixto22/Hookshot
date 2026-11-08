@@ -402,8 +402,8 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         // line would run into the title)
         SIZE tsz{};
         GetTextExtentPoint32A(dc, "Hookshot", 8, &tsz);
-        HFONT small = font(12 * s, FW_NORMAL);
-        SelectObject(dc, small);
+        HFONT small_font = font(12 * s, FW_NORMAL);
+        SelectObject(dc, small_font);
         SetTextColor(dc, RGB(140, 150, 144));
         std::string ver = HOOKSHOT_VERSION;
         const int room = (int)w - 32 * s - tsz.cx - 12 * s;
@@ -415,7 +415,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         }
         if (sz.cx <= room) TextOutA(dc, (int)w - 16 * s - sz.cx, 18 * s, ver.c_str(), (int)ver.size());
         SelectObject(dc, title);
-        DeleteObject(small);
+        DeleteObject(small_font);
     }
     SelectObject(dc, body);
     if (page == 1) {   // (hookshot) the Controls page
