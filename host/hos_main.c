@@ -299,6 +299,13 @@ static void load_hookshot_env(void) {
 }
 
 float hos_aspect_ratio = 0;   /* (the window's default shape: host/display.c) */
+/* (nx2/oot_occlusion.py) read by the game's code where it decides to make occlusion queries: 1, none (HOOKSHOT_OCCLUSION_OFF=1) */
+volatile int hos_occlusion_off;
+static void occlusion_switch(void) {
+    const char *e = getenv("HOOKSHOT_OCCLUSION_OFF");
+    hos_occlusion_off = e && e[0] == '1';
+    if (hos_occlusion_off) hos_log("occlusion off: the game makes no occlusion queries (HOOKSHOT_OCCLUSION_OFF=1)");
+}
 #ifdef _WIN32
 /* (hookshot) On laptops with two GPUs, the drivers run a program on the dedicated one when it exports these (NVIDIA Optimus, AMD
    PowerXpress): without them a laptop could put the game on its integrated GPU, 5 fps (issue 176) */
@@ -311,6 +318,9 @@ static int game_main(int argc, char **argv) {
 #endif
 #ifdef _WIN32
     load_hookshot_env();
+#endif
+    occlusion_switch();
+#ifdef _WIN32
     {   // (the whole process, not only the window's thread: the renderer asks the window's size from its own, and on a 4K screen at 150%
         // Windows answered such a thread 2560 x 1440: the picture was that size, in the corner of the window. Hookshot issues 15, 18, 20)
         typedef BOOL(WINAPI * SetAware)(void *);
