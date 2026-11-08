@@ -55,7 +55,8 @@ const char* tx_percent(int v) {
     return b;
 }
 const char* tx_resolution(int v) {
-    static const char* t[] = {"Auto", "100%", "75%", "67%", "50%"};
+    static const char* t[] = {"Auto", "100%", "75%", "67%", "50%", "133%", "150%", "167%"};   // (felix: 5-7 above the console's scale)
+    if ((unsigned)v >= sizeof t / sizeof t[0]) return t[0];
     return t[v];
 }
 const char* tx_speed(int v) { return v ? "Real time" : "Per frame"; }
@@ -70,9 +71,9 @@ Row rows[] = {
      "can show artifacts."},
     {"Frame pacing", &opts.pace, 0, 1, 1, tx_onoff,
      "Shows each frame at an even interval instead of as soon as it is ready. Less stutter, at up to one frame of delay."},
-    {"Resolution", &opts.resolution, 0, 4, 1, tx_resolution,
+    {"Resolution", &opts.resolution, 0, 7, 1, tx_resolution,
      "How sharp the 3D is drawn. Auto lets the game lower it when the GPU is busy. A fixed percentage stays steady: lower is "
-     "faster."},
+     "faster. Above 100% draws more than the console does (133%: 2048x1152, 167%: 2560x1440): sharper, heavier on the GPU."},
     {"Upscaling", &opts.upscale, 0, 2, 1, tx_upscale,
      "The filter that scales the picture to your window. Off is the plain copy. Catmull-Rom is sharper, Lanczos sharper still."},
     {"Anisotropic filtering", &opts.aniso, 0, 16, 1, tx_aniso,
@@ -472,6 +473,13 @@ void menu_tick() {
             Row& r = rows[selected];
             int v = *r.value + (press[4] ? r.step : -r.step);
             if (r.value == &opts.framegen && v == 1) v = press[4] ? 2 : 0;   // (off, 2x ... 8x)
+            if (r.value == &opts.resolution) {   // (felix: in order of scale: Auto, 167%, 150%, 133%, 100%, 75%, 67%, 50%)
+                static const int steps[] = {0, 7, 6, 5, 1, 2, 3, 4};
+                int at = 0;
+                while (at < 7 && steps[at] != *r.value) at++;
+                at = (at + (press[4] ? 7 : 1)) % 8;
+                v = steps[at];
+            }
             if (r.value == &opts.aniso) {   // (felix: the game's own, 2x, 4x, 8x, 16x)
                 static const int steps[] = {0, 2, 4, 8, 16};
                 int at = 0;
