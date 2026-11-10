@@ -138,6 +138,7 @@ static CONDITION_VARIABLE log_cv = CONDITION_VARIABLE_INIT;
 static char *log_q[2048];
 static int log_head, log_count;
 static volatile LONG log_async = -1;
+static volatile DWORD log_writer;   /* log_main's thread */
 
 static int log_take_locked(char **out) {
     int n = 0;
@@ -149,20 +150,60 @@ static int log_take_locked(char **out) {
     return n;
 }
 
+/* (hookshot) A batch goes out in one write. stderr is unbuffered (hos_main.c), so each line was a write of its own: 30-90 a
+   second in play, every one extending the log file. With the game on a slow disk (a SATA SSD, 90% full) those writes kept
+   the disk busy: its 4 KB reads took 10-200 ms where they take 0.4 ms, and what the game read from it meanwhile (a page of
+   its own code, a file of the game's) waited as long: the long frames of a session. */
 static void log_write(char **lines, int n) {
-    for (int i = 0; i < n; i++) {
-        fputs(lines[i], stderr);
-        free(lines[i]);
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += strlen(lines[i]);
+    char *all = n > 1 ? (char *)malloc(total + 1) : NULL;
+    if (all) {
+        size_t at = 0;
+        for (int i = 0; i < n; i++) {
+            const size_t len = strlen(lines[i]);
+            memcpy(all + at, lines[i], len);
+            at += len;
+            free(lines[i]);
+        }
+        fwrite(all, 1, total, stderr);
+        free(all);
+    } else {   /* (one line, or no memory for the batch: line by line) */
+        for (int i = 0; i < n; i++) {
+            fputs(lines[i], stderr);
+            free(lines[i]);
+        }
     }
     fflush(stderr);
+}
+
+/* (hookshot) and the writer waits a little after the line it is woken for, so the lines of that time go out together: a few
+   writes a second however many lines there are. A queue half full goes out at once, before a burst can fill it (a full
+   queue has the thread that logs write the line itself). HOS_LOG_BATCH_MS=<ms> (default 250, at most 2000; 0: the lines
+   there are at each wake, as before). Nothing waiting is lost: every way out writes the queue first (log_flush,
+   log_crash_filter), and the writer holds no lock while it waits */
+enum { LOG_BATCH_FULL = 1024 };
+static DWORD log_batch_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        const char *e = getenv("HOS_LOG_BATCH_MS");
+        const int v = e && *e ? atoi(e) : 250;
+        ms = v < 0 ? 0 : v > 2000 ? 2000 : v;
+    }
+    return (DWORD)ms;
 }
 
 static DWORD WINAPI log_main(void *p) {
     (void)p;
     static char *batch[2048];
+    log_writer = GetCurrentThreadId();
     for (;;) {
         AcquireSRWLockExclusive(&log_lock);
         while (!log_count) SleepConditionVariableSRW(&log_cv, &log_lock, INFINITE, 0);
+        /* (log_queue wakes it at each line: until the time is up or the queue half full) */
+        const ULONGLONG until = GetTickCount64() + log_batch_ms();
+        for (ULONGLONG now; log_count < LOG_BATCH_FULL && (now = GetTickCount64()) < until;)
+            SleepConditionVariableSRW(&log_cv, &log_lock, (DWORD)(until - now), 0);
         const int n = log_take_locked(batch);
         AcquireSRWLockExclusive(&log_write_lock);
         ReleaseSRWLockExclusive(&log_lock);
@@ -171,8 +212,24 @@ static DWORD WINAPI log_main(void *p) {
     }
 }
 
+/* the queued lines straight to the handle (crash paths: no CRT stream, no write lock) */
+static void log_drain_raw(void) {
+    if (!TryAcquireSRWLockExclusive(&log_lock)) return;
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    while (log_count) {
+        const char *line = log_q[log_head];
+        DWORD written;
+        WriteFile(err, line, (DWORD)strlen(line), &written, NULL);
+        log_head = (log_head + 1) % 2048;
+        log_count--;
+    }
+    ReleaseSRWLockExclusive(&log_lock);
+}
+
 static void log_flush(void) {
     if (log_async <= 0) return;
+    /* (a crash report on the writer itself, in its own write: it holds log_write_lock) */
+    if (GetCurrentThreadId() == log_writer) { log_drain_raw(); return; }
     static char *batch[2048];
     AcquireSRWLockExclusive(&log_write_lock);
     AcquireSRWLockExclusive(&log_lock);
@@ -185,31 +242,31 @@ static void log_flush(void) {
 static LPTOP_LEVEL_EXCEPTION_FILTER log_prev_filter;
 
 static LONG WINAPI log_crash_filter(EXCEPTION_POINTERS *e) {
-    if (TryAcquireSRWLockExclusive(&log_write_lock)) {
-        if (TryAcquireSRWLockExclusive(&log_lock)) {
-            HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
-            while (log_count) {
-                const char *line = log_q[log_head];
-                DWORD written;
-                WriteFile(err, line, (DWORD)strlen(line), &written, NULL);
-                log_head = (log_head + 1) % 2048;
-                log_count--;
-            }
-            ReleaseSRWLockExclusive(&log_lock);
-        }
-        ReleaseSRWLockExclusive(&log_write_lock);
+    if (GetCurrentThreadId() == log_writer) log_drain_raw();
+    else {
+        /* the writer may be in the middle of a batch: it finishes first (at most 2 s: a write stuck on the disk), then the
+           rest of the queue goes out (before: the queue was left unwritten whenever the writer was busy) */
+        int got = 0;
+        for (int i = 0; i < 2000 && !(got = TryAcquireSRWLockExclusive(&log_write_lock)); i++) Sleep(1);
+        log_drain_raw();
+        if (got) ReleaseSRWLockExclusive(&log_write_lock);
     }
     return log_prev_filter ? log_prev_filter(e) : EXCEPTION_CONTINUE_SEARCH;
 }
 
+/* Lines are written by log_main, not by the thread that logs: a write that blocks (a console; the log file while the
+   disk is busy: the render thread was seen held 140-310 ms in one line's write) holds no game thread. Nothing queued is
+   lost when the game ends or crashes: hos_fatal, report_crash/report_fatal (mkw_glue.c), log_crash_filter,
+   svcExitProcess, the window's close and the process's exit (atexit) write the queue first. HOS_LOG_SYNC=1: each line
+   written by the thread that logs it, as files and pipes were before */
 static int log_queue(const char *line) {
     if (log_async < 0) {
         AcquireSRWLockExclusive(&log_lock);
         if (log_async < 0) {
-            DWORD mode;
-            int on = !getenv("HOS_LOG_SYNC") && GetConsoleMode(GetStdHandle(STD_ERROR_HANDLE), &mode);
+            int on = !getenv("HOS_LOG_SYNC");
             if (on && !CreateThread(NULL, 0, log_main, NULL, 0, NULL)) on = 0;
             if (on) log_prev_filter = SetUnhandledExceptionFilter(log_crash_filter);
+            if (on) atexit(log_flush);
             log_async = on;
         }
         ReleaseSRWLockExclusive(&log_lock);
@@ -540,12 +597,160 @@ static const NameSpec *match_name_spec(const NameSpec *s, int n, const char *nam
 /* The last physical core (its logical processors' mask), kept for the Vulkan back end's replay thread (gpu/vk
    vk_replay.cpp pins it there): the game's threads run on the others. The replay is on the frame's critical path
    (MKW waits for the last frame's GPU work before it submits the next), and on a core shared with game threads
-   it ran ~1.7x slower than alone. Only on machines with 8+ logical processors; HOS_RESERVE_CORE=0: none. */
+   it ran ~1.7x slower than alone. Only on machines with 8+ logical processors; HOS_RESERVE_CORE=0: none.
+   (hookshot) On a CPU with cores of more than one kind, the last core of the fastest kind: the last core of all is an
+   efficiency core on Intel's hybrid CPUs (an i7-12700K's logical processors 16-19), the slowest place for the replay
+   (an i7-13700K's Kokiri Forest: 48.7 fps with it there, 60 on a performance core). EfficiencyClass is higher the faster
+   the core, and the same for every core of a CPU of one kind (the last core, as before). Only with 4+ cores of the
+   fastest kind (8+ logical processors always have them on a CPU of one kind): a laptop's 2 performance cores and 8
+   efficiency ones (i5-1235U) would keep one of the two from the game; then none is kept. The calling thread's
+   processor group's cores: the masks the affinity calls take are its group's. Windows only: Linux keeps the last core,
+   as before. */
+/* (hookshot) The cores that share the largest L3, on a CPU whose cores do not all share one of the same size: AMD's X3D CPUs
+   with two CCDs (7900X3D, 7950X3D, 9900X3D, 9950X3D) have the 3D V-Cache on one CCD only (96 MB against 32 MB). Windows
+   moves a game there only when its Game Bar knows the program as a game; this one it does not know, so its threads ran on
+   both, and the replay's reserved core (the last one) is on the CCD without the cache. On a 9950X3D (SMT off), Castle Town's
+   market (2,300 draws): the replay 11.5-12.3 ms a frame and 57-58 fps as it was (the slowest two seconds 54), 10.1-10.5 ms and
+   59.9 fps (58.7) with the game's threads kept to the first CCD. So they are kept to those cores. 0 for none: one L3 for all, L3s
+   of one size (a 7950X, both CCDs alike), L3s that do not all share as many logical processors (a hybrid CPU's two kinds of
+   core: a Ryzen AI 9 HX 370 has 4 Zen 5 cores on a 16 MB L3 and 8 Zen 5c on an 8 MB one, and the game is not squeezed onto the 4;
+   an X3D's CCDs are alike but for the cache), or fewer than 8 cores on the largest (the 12-core 7900X3D and 9900X3D have 6 there:
+   not measured, left as they were). Measured with SMT off only: with it the 8 cores are 16 logical processors.
+   HOS_CACHE_CORES=0: none. Windows only, as the reserved core's choice above: Linux keeps the last core, which on these CPUs is
+   on the CCD without the cache.
+   (the choice: each L3's logical processor mask and size, n of them, and each core's mask, ncores of them.
+   tests/test_reserved_core.py) */
+static uint64_t pick_cache_cores(const uint64_t *masks, const uint64_t *sizes, int n, const uint64_t *cores, int ncores) {
+    uint64_t best = 0, most = 0, least = ~0ull;
+    int width = 0, alike = 1;   /* (how many logical processors an L3 is shared by, and whether all are shared by as many) */
+    for (int i = 0; i < n; i++) {
+        if (!masks[i] || !sizes[i]) continue;
+        if (!width) width = __builtin_popcountll(masks[i]);
+        else if (__builtin_popcountll(masks[i]) != width) alike = 0;
+        if (sizes[i] > most) most = sizes[i], best = masks[i];
+        else if (sizes[i] == most) best |= masks[i];   /* (several of the largest size: all of them) */
+        if (sizes[i] < least) least = sizes[i];
+    }
+    if (!best || least == most || !alike) return 0;
+    int physical = 0;
+    for (int i = 0; i < ncores; i++) physical += (cores[i] & best) != 0;
+    if (physical < 8) return 0;
+    return best;
+}
+/* (the choice: the cores' logical processor masks and EfficiencyClass, n of them; 0 for none. tests/test_reserved_core.py) */
+static uint64_t pick_reserved_core(const uint64_t *masks, const unsigned char *classes, int n) {
+    uint64_t last = 0;
+    int best = -1, fast = 0, logical = 0;
+    for (int i = 0; i < n; i++) {
+        if (!masks[i]) continue;
+        logical += __builtin_popcountll(masks[i]);
+        if ((int)classes[i] > best) {
+            best = classes[i], last = masks[i], fast = 1;
+        } else if ((int)classes[i] == best) {
+            fast++;
+            if (masks[i] > last) last = masks[i];
+        }
+    }
+    if (logical < 8 || fast < 4) return 0;
+    return last;
+}
+#if defined(_WIN32)
+/* (pick_cache_cores over the calling thread's group's L3 caches; 0: no such split, or HOS_CACHE_CORES=0) */
+uint64_t hos_cache_cpus(void) {
+    static uint64_t mask = ~0ull;
+    if (mask != ~0ull) return mask;
+    mask = 0;
+    if (getenv("HOS_CACHE_CORES") && !atoi(getenv("HOS_CACHE_CORES"))) return mask;
+    static uint64_t masks[64], sizes[64], cores[256];
+    DWORD len = 0;
+    int n = 0, ncores = 0;
+    GROUP_AFFINITY ga;
+    const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+    if (GetLogicalProcessorInformationEx(RelationCache, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) return mask;
+    char *buf = (char *)malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationCache, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+        for (DWORD at = 0; at < len && n < 64;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationCache && e->Cache.Level == 3 && e->Cache.GroupMask.Group == group) {
+                masks[n] = (uint64_t)e->Cache.GroupMask.Mask;
+                sizes[n] = e->Cache.CacheSize;
+                n++;
+            }
+            at += e->Size;
+        }
+    free(buf);
+    len = 0;   /* (and the group's cores: how many of them the largest L3 has) */
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER) return mask;
+    buf = (char *)malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+        for (DWORD at = 0; at < len && ncores < 256;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group)
+                cores[ncores++] = (uint64_t)e->Processor.GroupMask[0].Mask;
+            at += e->Size;
+        }
+    free(buf);
+    mask = pick_cache_cores(masks, sizes, n, cores, ncores);
+    if (mask) {
+        uint64_t most = 0, least = ~0ull;
+        for (int i = 0; i < n; i++) {
+            if (sizes[i] > most) most = sizes[i];
+            if (sizes[i] && sizes[i] < least) least = sizes[i];
+        }
+        hos_log("threads: the game's on logical processors %#llx, the cores that share the largest L3 (%llu MB; the others' is "
+                "%llu MB). HOS_CACHE_CORES=0: every core", (unsigned long long)mask, (unsigned long long)(most >> 20),
+                (unsigned long long)(least >> 20));
+    }
+    return mask;
+}
+/* (pick_reserved_core over the calling thread's group's cores; *cores: how many, 0 when they could not be read) */
+static uint64_t last_fastest_core(int *cores) {
+    static uint64_t masks[256];
+    static unsigned char classes[256];
+    DWORD len = 0;
+    int n = 0;
+    *cores = 0;
+    GROUP_AFFINITY ga;
+    const WORD group = GetThreadGroupAffinity(GetCurrentThread(), &ga) ? ga.Group : 0;
+    if (GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len) || GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+        return 0;
+    char *buf = (char *)malloc(len);
+    if (buf && GetLogicalProcessorInformationEx(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len))
+        for (DWORD at = 0; at < len && n < 256;) {
+            const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + at);
+            if (!e->Size) break;
+            if (e->Relationship == RelationProcessorCore && e->Processor.GroupCount && e->Processor.GroupMask[0].Group == group) {
+                masks[n] = (uint64_t)e->Processor.GroupMask[0].Mask;
+                classes[n] = e->Processor.EfficiencyClass;
+                n++;
+            }
+            at += e->Size;
+        }
+    free(buf);
+    *cores = n;
+    return pick_reserved_core(masks, classes, n);
+}
+#endif
 uint64_t hos_reserved_cpus(void) {
     static uint64_t mask = ~0ull;
     if (mask != ~0ull) return mask;
     mask = 0;
     if (getenv("HOS_RESERVE_CORE") && !atoi(getenv("HOS_RESERVE_CORE"))) return mask;
+#if defined(_WIN32)
+    /* (hookshot) none where the game is kept to the cores of the largest L3 (hos_cache_cpus): they are 8 cores on the CPUs
+       measured (a 9950X3D, SMT off), and with one of them kept for the replay the game's threads had 7. In the market the replay
+       then took 9.8-10.0 ms a frame but the frame rate stayed at 56.9-57.4; with the 8 shared, 10.1-10.5 ms and 59.9 fps.
+       HOS_RESERVE_CORE=1: the last core of the fastest kind is kept all the same, as on other CPUs. That is normally a core of
+       the other CCD, not the cache core of the 9.8-10.0 ms above, and the game's threads then have all of the cache cores */
+    if (hos_cache_cpus() && !(getenv("HOS_RESERVE_CORE") && atoi(getenv("HOS_RESERVE_CORE")))) return mask;
+    {
+        int cores = 0;
+        const uint64_t fast = last_fastest_core(&cores);
+        if (cores) return mask = fast;
+    }
+#endif
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION info[256];
     DWORD len = sizeof info;
     if (!GetLogicalProcessorInformation(info, &len)) return mask;
@@ -562,10 +767,17 @@ uint64_t hos_reserved_cpus(void) {
 
 void hos_thread_pin(void *h, const char *name) {
     const uint64_t reserved = hos_reserved_cpus();
-    if (reserved) {
+#if defined(_WIN32)
+    const uint64_t cache = hos_cache_cpus();   /* (hookshot: the cores of the largest L3, when the CPU's differ) */
+#else
+    const uint64_t cache = 0;
+#endif
+    if (reserved || cache) {
         DWORD_PTR proc = 0, sys = 0;
         GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys);
-        if ((uint64_t)proc & ~reserved) SetThreadAffinityMask(h, (DWORD_PTR)((uint64_t)proc & ~reserved));
+        uint64_t may = (uint64_t)proc;
+        if (cache && (may & cache)) may &= cache;
+        if (may & ~reserved) SetThreadAffinityMask(h, (DWORD_PTR)(may & ~reserved));
     }
     static NameSpec pins[24], prios[24];
     static int npins = -1, nprios;
@@ -582,6 +794,13 @@ void hos_thread_pin(void *h, const char *name) {
                                   THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST};
     if ((p = match_name_spec(prios, nprios, name)) && p->value >= -2 && p->value <= 2)
         SetThreadPriority(h, levels[p->value + 2]);
+    else if (strstr(name, "OptimizeChange") && !getenv("HOS_OCB_NORMAL")) {
+        /* (OoT's OptimizeChangeBank (guest priority 27, a background thread) walks every placed object of the
+           area by name, again and again (Kokiri: ~344 names, ~250k lookups a second). On the console it only gets the
+           time nothing more important wants; at the host's normal priority it took the renderer's and the driver's
+           cores and the frame waited (Kokiri, RX 6600 + 5600G: 17-20 fps; lowest: 21-28). HOS_OCB_NORMAL=1: as before) */
+        SetThreadPriority(h, THREAD_PRIORITY_LOWEST);
+    }
 }
 
 /* ---- time ------------------------------------------------------------------------------------------------ */
@@ -1228,6 +1447,10 @@ void hos_vcore_back(void) {
     HosThread *t = cur;
     if (hos_vcores_on() && t && !t->vc_held) vc_acquire(t);
 }
+/* Lifted code calls this from its interrupt polls with the loop's guest registers still in host registers (a64_poll_cur,
+   mkw_glue.c: the poll hands over no context, so the compiler need not spill them). It, and everything it calls, must never
+   read or write the thread's guest context (Ctx) or run guest code: what it would see there may be older than the loop. A
+   stall dump of a thread spinning in a polled loop shows such older registers for the same reason. */
 void hos_vcore_checkpoint(void) {
     HosThread *t = cur;
     if (t && t->vc_kick) vc_yield(t, t->vc_kick == 1);

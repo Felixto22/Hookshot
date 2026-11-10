@@ -231,6 +231,9 @@ struct TextureDescriptor {
     /// Index in Info::handle_programs when the handle is computed at draw time (read from a
     /// storage buffer), ~0 when it is the constant buffer word above.
     u32 handle_program{~0U};
+    /// The type is the instruction's own (TEX, TLD, TXD...) and no answer about the bound texture set it.
+    /// False for a size query that had to ask (TexturePass, ImageQueryDimensions), and for a descriptor it shares.
+    bool type_fixed{};
 
     auto operator<=>(const TextureDescriptor&) const = default;
 };
@@ -275,7 +278,9 @@ struct MeshInfo {
 struct Info {
     static constexpr size_t MAX_INDIRECT_CBUFS{14};
     static constexpr size_t MAX_CBUFS{18};
-    static constexpr size_t MAX_SSBOS{32};
+    // (hookshot, as Lichii #434: 64. Fritchii's pass binds every candidate pointer of an ambiguous access; the back end's
+    // layouts are built from the list, gpu/vk/vk_draw.cpp ensure_layout)
+    static constexpr size_t MAX_SSBOS{64};
 
     bool is_task{}; ///< Switch 2 task program (Stage::Task)
     bool is_mesh{}; ///< Switch 2 mesh program (Stage::Mesh)
@@ -311,6 +316,10 @@ struct Info {
     bool stores_indexed_attributes{};
 
     bool stores_global_memory{};
+    /// (from Fritchii) Native global accesses whose pointer is chosen at run time: the candidate storage buffers (not
+    /// the driver bank's NVN slots) carry no NVN size word, so the binding's length bounds them, and the access goes
+    /// to the candidate whose base is the nearest at or below its address (gpu/vk/vk_draw.cpp binds them bare)
+    bool native_global_bounds{};
     bool uses_local_memory{};
 
     bool uses_fp16{};

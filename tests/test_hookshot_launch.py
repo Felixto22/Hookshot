@@ -9,6 +9,9 @@ import subprocess
 import tempfile
 import unittest
 
+# (Linux only)
+RUN_ALL_SKIP = {"windows": "the Linux launcher, a POSIX shell script"}
+
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCH = ROOT / "builder" / "linux" / "hookshot-launch"
 
@@ -70,6 +73,25 @@ class LaunchTests(unittest.TestCase):
         self.assertIn("PYTHONPATH=UNSET", lines)
         self.assertIn("HOME=%s" % os.environ["HOME"], lines)
 
+    def test_play_starts_the_game_in_bin_not_the_launcher(self):
+        with tempfile.TemporaryDirectory(prefix="hookshot-launch-") as tmp:
+            root = Path(tmp)
+            folder = root / "game"
+            game(folder)
+            (folder / "hookshot").write_text("#!/bin/sh\nprintf 'launcher\\n'\n", encoding="utf-8")
+            nested = folder / "bin"
+            nested.mkdir()
+            exe = nested / "hookshot"
+            exe.write_text(
+                "#!/bin/sh\nprintf 'game\\n'\nprintf 'CHECK=%s\\n' \"${HOOKSHOT_NO_UPDATE_CHECK-UNSET}\"\n",
+                encoding="utf-8",
+            )
+            exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+            ran = subprocess.run([str(LAUNCH), str(folder)], env=self.env(), text=True, capture_output=True, check=False)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(ran.stdout.splitlines()[0], "game")
+        self.assertIn("CHECK=1", ran.stdout)
+
     def test_a_folder_argument_wins(self):
         with tempfile.TemporaryDirectory(prefix="hookshot-launch-") as tmp:
             root = Path(tmp)
@@ -88,6 +110,30 @@ class LaunchTests(unittest.TestCase):
             )
         self.assertEqual(ran.returncode, 0, ran.stderr)
         self.assertEqual(ran.stdout.splitlines()[0], str(other))
+
+    def test_relative_folder_paths(self):
+        for source in ("argument", "config"):
+            for relative in ("100% Games", "./100% Games"):
+                with self.subTest(source=source, folder=relative):
+                    with tempfile.TemporaryDirectory(prefix="hookshot-launch-") as tmp:
+                        root = Path(tmp)
+                        folder = root / "100% Games"
+                        game(folder)
+                        ini = root / "builder.ini"
+                        ini.write_text("out=%s\n" % relative, encoding="utf-8")
+                        args = [str(LAUNCH)]
+                        if source == "argument":
+                            args.append(relative)
+                        ran = subprocess.run(
+                            args,
+                            cwd=root,
+                            env=self.env(HOOKSHOT_LAUNCH_CONFIG=str(ini)),
+                            text=True,
+                            capture_output=True,
+                            check=False,
+                        )
+                    self.assertEqual(ran.returncode, 0, ran.stderr)
+                    self.assertEqual(ran.stdout.splitlines()[0], str(folder))
 
     def test_no_game_is_an_error(self):
         with tempfile.TemporaryDirectory(prefix="hookshot-launch-") as tmp:

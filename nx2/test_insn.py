@@ -29,6 +29,12 @@ import toolchain   # noqa: E402
 import unicorn     # noqa: E402
 from unicorn import arm64_const as A   # noqa: E402
 
+# (the game: this runs the lifted code of a real dump against Unicorn)
+RUN_ALL_SKIP = {
+    "linux": "needs the game's modules (work/dump) and Unicorn",
+    "windows": "needs the game's modules (work/dump) and Unicorn",
+}
+
 
 class _Unicorn:
     """insn_test's view of the unicorn module: every engine it makes runs the ARMv8.x "max" CPU"""
@@ -84,7 +90,7 @@ def main():
     insn_test.unicorn = _Unicorn
     insn_test.mem_regs = mem_regs
     base_target = toolchain.native_target
-    toolchain.native_target = lambda: base_target() + ["-mcx16"]
+    toolchain.native_target = lambda *a, **k: base_target(*a, **k) + ["-mcx16"]
     base_sample = insn_test.sample
 
     def sample(image_dir, mods, per, rng):
